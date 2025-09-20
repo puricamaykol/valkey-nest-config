@@ -1,0 +1,110 @@
+// valkey.service.ts
+import { Inject, Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
+import { GlideClient, GlideClusterClient, Logger } from '@valkey/valkey-glide';
+import { VALKEY_CLIENT } from './valkey.module';
+
+@Injectable()
+export class ValkeyService implements OnModuleDestroy {
+  private readonly logger = new Logger(ValkeyService.name);
+
+  constructor(@Inject(VALKEY_CLIENT) private readonly client: GlideClusterClient) {}
+
+  // -------- Core KV --------
+  async set(key: string, value: string, ttlSec?: number): Promise<'OK' | null> {
+    if (ttlSec && ttlSec > 0) return this.client.set(key, value, 'EX', ttlSec);
+    return this.client.set(key, value);
+  }
+
+  async get(key: string): Promise<string | null> {
+    return this.client.get(key);
+  }
+
+  async del(key: string | string[]): Promise<number> {
+    return this.client.del(key as any);
+  }
+
+  async incrBy(key: string, by = 1): Promise<number> {
+    return this.client.incrby(key, by);
+  }
+
+  async exists(key: string): Promise<boolean> {
+    return (await this.client.exists(key)) === 1;
+  }
+
+  // -------- JSON helpers (serialize/deserialize) --------
+  async setJSON<T>(key: string, data: T, ttlSec?: number): Promise<'OK' | null> {
+    return this.set(key, JSON.stringify(data), ttlSec);
+  }
+
+  async getJSON<T>(key: string): Promise<T | null> {
+    const raw = await this.get(key);
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw) as T;
+    } catch (e) {
+      this.logger.warn(`JSON parse failed for key=${key}: ${(e as Error).message}`);
+      return null;
+    }
+  }
+
+  // -------- Multi (pipeline) --------
+  async mget(keys: string[]): Promise<(string | null)[]> {
+    if (keys.length === 0) return [];
+    return this.client.mget(...keys);
+  }
+
+  async mset(pairs: Record<string, string>): Promise<'OK'> {
+    const flat: string[] = [];
+    for (const [k, v] of Object.entries(pairs)) flat.push(k, v);
+    return this.client.mset(...(flat as [string, string]));
+  }
+
+  // Pipeline ejemplo (SET con TTL para N pares)
+  async pipelineSet(pairs: { key: string; value: string; ttlSec?: number }[]) {
+    const pipe = this.client.pipeline();
+    for (const p of pairs) {
+      if (p.ttlSec && p.ttlSec > 0) pipe.set(p.key, p.value, 'EX', p.ttlSec);
+      else pipe.set(p.key, p.value);
+    }
+    return pipe.exec();
+  }
+
+  // -------- Locks simples (SET NX PX) --------
+  async tryLock(key: string, ownerId: string, ttlMs: number): Promise<boolean> {
+    const res = await this.client.set(key, ownerId, 'PX', ttlMs, 'NX');
+    return res === 'OK';
+  }
+
+  async releaseLock(key: string, ownerId: string): Promise<boolean> {
+    // Lua para liberar solo si el owner coincide
+    const script = `
+      if redis.call("GET", KEYS[1]) == ARGV[1] then
+        return redis.call("DEL", KEYS[1])
+      else
+        return 0
+      end
+    `;
+    const result = await this.client.eval(script, 1, key, ownerId);
+    return result === 1;
+  }
+
+  // -------- Pub/Sub (opcional) --------
+  // Para suscripción crea una conexión separada si lo necesitas.
+  async publish(channel: string, message: string): Promise<number> {
+    return this.client.publish(channel, message);
+  }
+
+  // -------- Healthcheck --------
+  async ping(): Promise<string> {
+    return this.client.ping();
+  }
+
+  // -------- Shutdown limpio --------
+  async onModuleDestroy() {
+    try {
+      await this.client.quit(); // intenta cerrar gracefully
+    } catch {
+      this.client.disconnect(); // fuerza cierre si falla
+    }
+  }
+}
